@@ -3,7 +3,6 @@ import jwt, { SignOptions } from "jsonwebtoken";
 import { User } from "../models/user.model";
 import { loginSchema, registerSchema } from "../schemas/auth.schema";
 
-
 function signToken(userId: string, role: string) {
   const secret = process.env.JWT_SECRET;
 
@@ -34,6 +33,7 @@ export async function register(req: Request, res: Response) {
 
   if (existingUser) {
     return res.status(409).json({
+      error: true,
       message: "Email already exists",
     });
   }
@@ -49,7 +49,8 @@ export async function register(req: Request, res: Response) {
 
   return res.status(201).json({
     message: "User registered successfully",
-    token,
+    // token,
+    success: true,
     user: {
       id: user.id,
       name: user.name,
@@ -89,6 +90,13 @@ export async function login(req: Request, res: Response) {
 
   const token = signToken(user.id, user.role);
 
+  res.cookie("accessToken", token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "lax",
+    maxAge: 15 * 60 * 1000,
+  });
+
   return res.json({
     message: "Login successful",
     token,
@@ -100,3 +108,15 @@ export async function login(req: Request, res: Response) {
     },
   });
 }
+
+export const logout = async (req: Request, res: Response) => {
+  res.clearCookie("accessToken", {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "lax",
+  });
+
+  return res.status(200).json({
+    message: "Logout successful",
+  });
+};
