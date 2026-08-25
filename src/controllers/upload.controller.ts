@@ -369,6 +369,14 @@ export async function getDownload(req: AuthRequest, res: Response) {
       });
     }
 
+    const contentLength = s3Object.ContentLength || upload.size;
+
+    if (contentLength) {
+      res.setHeader("Content-Length", contentLength.toString());
+    }
+
+    res.setHeader("Access-Control-Expose-Headers", "Content-Length");
+
     res.setHeader(
       "Content-Type",
       upload.mimeType || "application/octet-stream",
