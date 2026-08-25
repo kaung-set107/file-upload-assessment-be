@@ -79,6 +79,12 @@ export async function login(req: Request, res: Response) {
       message: "Invalid email or password",
     });
   }
+  const isActive = user.status === "active";
+  if (!isActive) {
+    return res.status(401).json({
+      message: "Invalid user!",
+    });
+  }
 
   const isPasswordValid = await user.comparePassword(password);
 
@@ -94,7 +100,7 @@ export async function login(req: Request, res: Response) {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
     sameSite: "lax",
-    maxAge: 15 * 60 * 1000,
+    maxAge: 60 * 60 * 1000,
   });
 
   return res.json({

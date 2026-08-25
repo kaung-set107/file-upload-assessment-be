@@ -6,7 +6,8 @@ import {
   S3Client,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-
+import { AuthRequest } from "../middleware/auth.middleware";
+import { IUpload, Upload } from "../models/upload.model";
 function getS3Config() {
   const region = process.env.AWS_REGION;
   const bucket = process.env.AWS_S3_BUCKET;
@@ -129,7 +130,8 @@ export async function deleteObjectFromS3(fileKey: string) {
   await client.send(
     new DeleteObjectCommand({
       Bucket: bucket,
-      Key: `uploads/${fileKey}`,
+      Key: fileKey,
     }),
   );
 }
+

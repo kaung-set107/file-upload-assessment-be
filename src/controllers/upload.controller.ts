@@ -3,6 +3,7 @@ import { randomUUID } from "crypto";
 import mongoose, { HydratedDocument } from "mongoose";
 import { AuthRequest } from "../middleware/auth.middleware";
 import { IUpload, Upload } from "../models/upload.model";
+
 import {
   createPresignedDownloadUrl,
   createPresignedUploadUrl,
@@ -13,6 +14,7 @@ import {
   presignUploadSchema,
   updateUploadSchema,
 } from "../schemas/upload.schema";
+import { getObjectFromS3 } from "../services/s3.service";
 
 function buildShareLink(req: Request, shareToken: string) {
   const protocolHeader = req.headers["x-forwarded-proto"];
@@ -31,6 +33,7 @@ function formatUpload(upload: UploadDocument) {
     id: upload._id.toString(),
     user: upload.user.toString(),
     file: upload.file,
+    s3Key: upload.s3Key,
     description: upload.description,
     date: upload.date,
     status: upload.status,
@@ -46,8 +49,7 @@ function formatUpload(upload: UploadDocument) {
 
 function canAccessUpload(req: AuthRequest, upload: UploadDocument) {
   return (
-    req.user?.role === "admin" ||
-    upload.user.toString() === req.user?.userId
+    req.user?.role === "admin" || upload.user.toString() === req.user?.userId
   );
 }
 
@@ -77,6 +79,7 @@ export async function createPresignedUpload(req: AuthRequest, res: Response) {
   return res.status(200).json({
     message: "Presigned upload URL generated successfully",
     success: true,
+    s3Key: presigned.fileKey,
     ...presigned,
   });
 }
@@ -99,7 +102,6 @@ export async function createUpload(req: AuthRequest, res: Response) {
 
   const shareToken = randomUUID();
   const shareLink = buildShareLink(req, shareToken);
-
   const upload = await Upload.create({
     user: req.user.userId,
     file: parsed.data.file,
@@ -107,6 +109,7 @@ export async function createUpload(req: AuthRequest, res: Response) {
     date: parsed.data.date || new Date(),
     status: parsed.data.status || "private",
     shareLink,
+    s3Key: parsed.data.s3Key,
     shareToken,
     originalName: parsed.data.originalName,
     mimeType: parsed.data.mimeType,
@@ -127,8 +130,7 @@ export async function getUploads(req: AuthRequest, res: Response) {
     });
   }
 
-  const query =
-    req.user.role === "admin" ? {} : { user: req.user.userId };
+  const query = req.user.role === "admin" ? {} : { user: req.user.userId };
   const uploads = await Upload.find(query).sort({ createdAt: -1 });
 
   return res.json({
@@ -138,38 +140,56 @@ export async function getUploads(req: AuthRequest, res: Response) {
 }
 
 export async function getUploadById(req: AuthRequest, res: Response) {
-  if (!req.user) {
-    return res.status(401).json({
-      message: "Unauthorized",
+  try {
+    const upload = await Upload.findById(req.params.id);
+
+    if (!upload) {
+      return res.status(404).json({
+        message: "Upload not found",
+      });
+    }
+
+    if (upload.status === "public") {
+      return res.json({
+        success: true,
+        upload: {
+          id: upload._id.toString(),
+          originalName: upload.originalName,
+          mimeType: upload.mimeType,
+          status: upload.status,
+        },
+      });
+    }
+
+    if (!req.user) {
+      return res.status(401).json({
+        message: "Login required to access this private file",
+      });
+    }
+
+    // Owner check
+    if (upload.user.toString() !== req.user.userId) {
+      return res.status(403).json({
+        message: "You do not have permission to access this file",
+      });
+    }
+
+    return res.json({
+      success: true,
+      upload: {
+        id: upload._id.toString(),
+        originalName: upload.originalName,
+        mimeType: upload.mimeType,
+        status: upload.status,
+      },
+    });
+  } catch (error) {
+    console.error("Get upload error:", error);
+
+    return res.status(500).json({
+      message: "Unable to get file",
     });
   }
-
-  const { id } = req.params;
-
-  if (!mongoose.isValidObjectId(id)) {
-    return res.status(400).json({
-      message: "Invalid upload id",
-    });
-  }
-
-  const upload = await Upload.findById(id);
-
-  if (!upload) {
-    return res.status(404).json({
-      message: "Upload not found",
-    });
-  }
-
-  if (!canAccessUpload(req, upload)) {
-    return res.status(403).json({
-      message: "Forbidden",
-    });
-  }
-
-  return res.json({
-    success: true,
-    upload: formatUpload(upload),
-  });
 }
 
 export async function updateUpload(req: AuthRequest, res: Response) {
@@ -210,8 +230,8 @@ export async function updateUpload(req: AuthRequest, res: Response) {
     });
   }
 
-  const previousFileKey = upload.file;
-  const nextFileKey = parsed.data.file;
+  const previousFileKey = upload.s3Key || upload.file;
+  const nextFileKey = parsed.data.s3Key || parsed.data.file;
 
   if (parsed.data.file !== undefined) {
     upload.file = parsed.data.file;
@@ -283,7 +303,7 @@ export async function deleteUpload(req: AuthRequest, res: Response) {
     });
   }
 
-  await deleteObjectFromS3(upload.file);
+  await deleteObjectFromS3(upload.s3Key);
   await upload.deleteOne();
 
   return res.json({
@@ -308,12 +328,64 @@ export async function getSharedUpload(req: Request, res: Response) {
       message: "Upload not found",
     });
   }
-
-  const downloadUrl = await createPresignedDownloadUrl(upload.file);
+  const downloadUrl = await createPresignedDownloadUrl(upload.s3Key);
 
   return res.json({
     success: true,
     upload: formatUpload(upload),
     downloadUrl,
   });
+}
+
+export async function getDownload(req: AuthRequest, res: Response) {
+  try {
+    const upload = await Upload.findById(req.params.id);
+
+    if (!upload) {
+      return res.status(404).json({
+        message: "Upload not found",
+      });
+    }
+
+    if (upload.status === "private") {
+      if (!req.user) {
+        return res.status(401).json({
+          message: "Login required",
+        });
+      }
+
+      if (upload.user.toString() !== req.user.userId) {
+        return res.status(403).json({
+          message: "You do not have permission to access this file",
+        });
+      }
+    }
+
+    const s3Object = await getObjectFromS3(upload.s3Key);
+
+    if (!s3Object.Body) {
+      return res.status(404).json({
+        message: "File not found in S3",
+      });
+    }
+
+    res.setHeader(
+      "Content-Type",
+      upload.mimeType || "application/octet-stream",
+    );
+
+    res.setHeader("Cache-Control", "private, no-cache, no-store");
+
+    const body = s3Object.Body;
+
+    if (body && "pipe" in body) {
+      (body as NodeJS.ReadableStream).pipe(res);
+    }
+  } catch (error) {
+    console.error("Get upload content error:", error);
+
+    return res.status(500).json({
+      message: "Unable to retrieve file",
+    });
+  }
 }

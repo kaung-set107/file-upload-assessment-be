@@ -15,6 +15,7 @@ export interface IUpload extends Document {
   size?: number;
   createdAt?: Date;
   updatedAt?: Date;
+  s3Key: string;
 }
 
 const uploadSchema = new Schema<IUpload>(
@@ -34,6 +35,10 @@ const uploadSchema = new Schema<IUpload>(
       type: String,
       trim: true,
       default: "",
+    },
+    s3Key: {
+      type: String,
+      unique: true,
     },
     date: {
       type: Date,

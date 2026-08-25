@@ -22,12 +22,6 @@ app.use(
 );
 app.use(express.json());
 
-app.get("/", (_req, res) => {
-  res.json({
-    message: "Senior Fullstack Test API is running",
-  });
-});
-
 app.use("/api/auth", authRoutes);
 app.use("/api/users", userRoutes);
 app.use("/api/uploads", uploadRoutes);

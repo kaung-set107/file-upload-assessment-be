@@ -15,6 +15,7 @@ export const createUploadSchema = z.object({
   originalName: z.string().min(1).optional(),
   mimeType: z.string().min(1).optional(),
   size: z.coerce.number().int().nonnegative().optional(),
+  s3Key: z.string().min(1),
 });
 
 export const updateUploadSchema = createUploadSchema.partial();
