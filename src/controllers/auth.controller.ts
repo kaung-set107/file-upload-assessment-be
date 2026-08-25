@@ -119,7 +119,7 @@ export const logout = async (req: Request, res: Response) => {
   res.clearCookie("accessToken", {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
-    sameSite: "lax",
+    sameSite: "none",
   });
 
   return res.status(200).json({
