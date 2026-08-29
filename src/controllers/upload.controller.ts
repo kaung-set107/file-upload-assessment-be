@@ -8,9 +8,15 @@ import {
   createPresignedDownloadUrl,
   createPresignedUploadUrl,
   deleteObjectFromS3,
+  deleteObjectsFromS3,
+  deleteObjectsFromS3ByPrefix,
 } from "../config/s3";
 import {
+  MAX_UPLOAD_FILE_SIZE_BYTES,
+  cancelBatchUploadSchema,
+  createBatchUploadSchema,
   createUploadSchema,
+  presignBatchUploadSchema,
   presignUploadSchema,
   updateUploadSchema,
 } from "../schemas/upload.schema";
@@ -53,6 +59,136 @@ function canAccessUpload(req: AuthRequest, upload: UploadDocument) {
   );
 }
 
+type QuotaCheckResult =
+  | {
+      ok: true;
+      usedStorageBytes: number;
+      remainingStorageBytes: number;
+    }
+  | {
+      ok: false;
+      status: 413;
+      message: string;
+      maxFileSizeBytes: number;
+      usedStorageBytes: number;
+      remainingStorageBytes: number;
+    };
+
+type BatchUploadFile = {
+  fileName: string;
+  contentType?: string;
+  size: number;
+};
+
+type BatchQuotaCheckResult =
+  | {
+      ok: true;
+      usedStorageBytes: number;
+      remainingStorageBytes: number;
+      batchSizeBytes: number;
+    }
+  | {
+      ok: false;
+      status: 413;
+      message: string;
+      maxFileSizeBytes: number;
+      usedStorageBytes: number;
+      remainingStorageBytes: number;
+      batchSizeBytes: number;
+    };
+
+async function getUserStorageUsageBytes(
+  userId: string,
+  excludedUploadId?: string,
+) {
+  const match: Record<string, unknown> = {
+    user: new mongoose.Types.ObjectId(userId),
+  };
+
+  if (excludedUploadId && mongoose.isValidObjectId(excludedUploadId)) {
+    match._id = { $ne: new mongoose.Types.ObjectId(excludedUploadId) };
+  }
+
+  const [result] = await Upload.aggregate<{
+    _id: null;
+    totalSize: number;
+  }>([
+    {
+      $match: match,
+    },
+    {
+      $group: {
+        _id: null,
+        totalSize: {
+          $sum: {
+            $ifNull: ["$size", 0],
+          },
+        },
+      },
+    },
+  ]);
+
+  return result?.totalSize ?? 0;
+}
+
+async function validateUploadQuota(options: {
+  userId: string;
+  fileSizeBytes: number;
+  excludedUploadId?: string;
+}): Promise<QuotaCheckResult> {
+  const usedStorageBytes = await getUserStorageUsageBytes(
+    options.userId,
+    options.excludedUploadId,
+  );
+  const remainingStorageBytes =
+    MAX_UPLOAD_FILE_SIZE_BYTES - usedStorageBytes;
+
+  if (options.fileSizeBytes > remainingStorageBytes) {
+    return {
+      ok: false,
+      status: 413,
+      message: "File exceeds the remaining 5 GB storage quota",
+      maxFileSizeBytes: MAX_UPLOAD_FILE_SIZE_BYTES,
+      usedStorageBytes,
+      remainingStorageBytes: Math.max(remainingStorageBytes, 0),
+    };
+  }
+
+  return {
+    ok: true,
+    usedStorageBytes,
+    remainingStorageBytes: Math.max(remainingStorageBytes, 0),
+  };
+}
+
+async function validateBatchUploadQuota(options: {
+  userId: string;
+  files: BatchUploadFile[];
+}): Promise<BatchQuotaCheckResult> {
+  const usedStorageBytes = await getUserStorageUsageBytes(options.userId);
+  const batchSizeBytes = options.files.reduce((total, file) => total + file.size, 0);
+  const remainingStorageBytes = MAX_UPLOAD_FILE_SIZE_BYTES - usedStorageBytes;
+
+  if (batchSizeBytes > remainingStorageBytes) {
+    return {
+      ok: false,
+      status: 413,
+      message: "Batch exceeds the remaining 5 GB storage quota",
+      maxFileSizeBytes: MAX_UPLOAD_FILE_SIZE_BYTES,
+      usedStorageBytes,
+      remainingStorageBytes: Math.max(remainingStorageBytes, 0),
+      batchSizeBytes,
+    };
+  }
+
+  return {
+    ok: true,
+    usedStorageBytes,
+    remainingStorageBytes: Math.max(remainingStorageBytes, 0),
+    batchSizeBytes,
+  };
+}
+
 export async function createPresignedUpload(req: AuthRequest, res: Response) {
   const parsed = presignUploadSchema.safeParse(req.body);
 
@@ -69,6 +205,35 @@ export async function createPresignedUpload(req: AuthRequest, res: Response) {
     });
   }
 
+  if (parsed.data.fileId && !mongoose.isValidObjectId(parsed.data.fileId)) {
+    return res.status(400).json({
+      message: "Invalid upload id",
+    });
+  }
+
+  const uploadSize = parsed.data.size;
+
+  if (typeof uploadSize !== "number") {
+    return res.status(400).json({
+      message: "File size is required",
+    });
+  }
+
+  const quotaCheck = await validateUploadQuota({
+    userId: req.user.userId,
+    fileSizeBytes: uploadSize!,
+    excludedUploadId: parsed.data.fileId,
+  });
+
+  if (!quotaCheck.ok) {
+    return res.status(quotaCheck.status).json({
+      message: quotaCheck.message,
+      maxFileSizeBytes: quotaCheck.maxFileSizeBytes,
+      usedStorageBytes: quotaCheck.usedStorageBytes,
+      remainingStorageBytes: quotaCheck.remainingStorageBytes,
+    });
+  }
+
   const { fileName, contentType } = parsed.data;
   const presigned = await createPresignedUploadUrl({
     userId: req.user.userId,
@@ -80,6 +245,9 @@ export async function createPresignedUpload(req: AuthRequest, res: Response) {
     message: "Presigned upload URL generated successfully",
     success: true,
     s3Key: presigned.fileKey,
+    maxFileSizeBytes: MAX_UPLOAD_FILE_SIZE_BYTES,
+    usedStorageBytes: quotaCheck.usedStorageBytes,
+    remainingStorageBytes: quotaCheck.remainingStorageBytes,
     ...presigned,
   });
 }
@@ -100,6 +268,20 @@ export async function createUpload(req: AuthRequest, res: Response) {
     });
   }
 
+  const quotaCheck = await validateUploadQuota({
+    userId: req.user.userId,
+    fileSizeBytes: parsed.data.size!,
+  });
+
+  if (!quotaCheck.ok) {
+    return res.status(quotaCheck.status).json({
+      message: quotaCheck.message,
+      maxFileSizeBytes: quotaCheck.maxFileSizeBytes,
+      usedStorageBytes: quotaCheck.usedStorageBytes,
+      remainingStorageBytes: quotaCheck.remainingStorageBytes,
+    });
+  }
+
   const shareToken = randomUUID();
   const shareLink = buildShareLink(req, shareToken);
   const upload = await Upload.create({
@@ -113,13 +295,207 @@ export async function createUpload(req: AuthRequest, res: Response) {
     shareToken,
     originalName: parsed.data.originalName,
     mimeType: parsed.data.mimeType,
-    size: parsed.data.size,
+    size: parsed.data.size!,
   });
 
   return res.status(201).json({
     message: "Upload created successfully",
     success: true,
     upload: formatUpload(upload),
+  });
+}
+
+export async function createBatchPresignedUpload(
+  req: AuthRequest,
+  res: Response,
+) {
+  const parsed = presignBatchUploadSchema.safeParse(req.body);
+
+  if (!parsed.success) {
+    return res.status(400).json({
+      message: "Validation failed",
+      errors: parsed.error.flatten().fieldErrors,
+    });
+  }
+
+  if (!req.user) {
+    return res.status(401).json({
+      message: "Unauthorized",
+    });
+  }
+
+  const quotaCheck = await validateBatchUploadQuota({
+    userId: req.user.userId,
+    files: parsed.data.files,
+  });
+
+  if (!quotaCheck.ok) {
+    return res.status(quotaCheck.status).json({
+      message: quotaCheck.message,
+      maxFileSizeBytes: quotaCheck.maxFileSizeBytes,
+      usedStorageBytes: quotaCheck.usedStorageBytes,
+      remainingStorageBytes: quotaCheck.remainingStorageBytes,
+      batchSizeBytes: quotaCheck.batchSizeBytes,
+    });
+  }
+
+  const uploads = await Promise.all(
+    parsed.data.files.map(async (file) => {
+      const presigned = await createPresignedUploadUrl({
+        userId: req.user!.userId,
+        fileName: file.fileName,
+        contentType: file.contentType,
+      });
+
+      return {
+        fileName: file.fileName,
+        contentType: file.contentType,
+        size: file.size,
+        s3Key: presigned.fileKey,
+        uploadUrl: presigned.uploadUrl,
+        fileUrl: presigned.fileUrl,
+        expiresIn: presigned.expiresIn,
+      };
+    }),
+  );
+
+  return res.status(200).json({
+    message: "Batch presigned upload URLs generated successfully",
+    success: true,
+    maxFileSizeBytes: MAX_UPLOAD_FILE_SIZE_BYTES,
+    usedStorageBytes: quotaCheck.usedStorageBytes,
+    remainingStorageBytes: quotaCheck.remainingStorageBytes,
+    batchSizeBytes: quotaCheck.batchSizeBytes,
+    uploads,
+  });
+}
+
+export async function createBatchUpload(req: AuthRequest, res: Response) {
+  const parsed = createBatchUploadSchema.safeParse(req.body);
+
+  if (!parsed.success) {
+    return res.status(400).json({
+      message: "Validation failed",
+      errors: parsed.error.flatten().fieldErrors,
+    });
+  }
+
+  if (!req.user) {
+    return res.status(401).json({
+      message: "Unauthorized",
+    });
+  }
+
+  const quotaCheck = await validateBatchUploadQuota({
+    userId: req.user.userId,
+    files: parsed.data.uploads.map((upload) => ({
+      fileName: upload.file,
+      size: upload.size,
+    })),
+  });
+
+  if (!quotaCheck.ok) {
+    return res.status(quotaCheck.status).json({
+      message: quotaCheck.message,
+      maxFileSizeBytes: quotaCheck.maxFileSizeBytes,
+      usedStorageBytes: quotaCheck.usedStorageBytes,
+      remainingStorageBytes: quotaCheck.remainingStorageBytes,
+      batchSizeBytes: quotaCheck.batchSizeBytes,
+    });
+  }
+
+  const uploadsToCreate = parsed.data.uploads.map((upload) => {
+    const shareToken = randomUUID();
+
+    return {
+      user: req.user!.userId,
+      file: upload.file,
+      description: upload.description || "",
+      date: upload.date || new Date(),
+      status: upload.status || "private",
+      shareLink: buildShareLink(req, shareToken),
+      s3Key: upload.s3Key,
+      shareToken,
+      originalName: upload.originalName,
+      mimeType: upload.mimeType,
+      size: upload.size,
+    };
+  });
+
+  const uploads = (await Upload.insertMany(uploadsToCreate)) as unknown as UploadDocument[];
+
+  return res.status(201).json({
+    message: "Batch uploads created successfully",
+    success: true,
+    uploads: uploads.map(formatUpload),
+  });
+}
+
+export async function cancelBatchUpload(req: AuthRequest, res: Response) {
+  const parsed = cancelBatchUploadSchema.safeParse(req.body);
+
+  if (!parsed.success) {
+    return res.status(400).json({
+      message: "Validation failed",
+      errors: parsed.error.flatten().fieldErrors,
+    });
+  }
+
+  if (!req.user) {
+    return res.status(401).json({
+      message: "Unauthorized",
+    });
+  }
+
+  if (
+    req.user.role !== "admin" &&
+    !parsed.data.s3Key.startsWith(`uploads/${req.user.userId}/`)
+  ) {
+    return res.status(403).json({
+      message: "You do not have permission to remove this upload",
+    });
+  }
+
+  const query =
+    req.user.role === "admin"
+      ? { s3Key: parsed.data.s3Key }
+      : {
+          s3Key: parsed.data.s3Key,
+          user: req.user.userId,
+        };
+
+  const upload = await Upload.findOneAndDelete(query);
+
+  await deleteObjectFromS3(parsed.data.s3Key);
+
+  return res.status(200).json({
+    success: true,
+    message: "Pending upload removed successfully",
+    deletedRecord: Boolean(upload),
+  });
+}
+
+export async function getUserUploadsLeftFileSize(
+  req: AuthRequest,
+  res: Response,
+) {
+  if (!req.user) {
+    return res.status(401).json({
+      message: "Unauthorized",
+    });
+  }
+
+  const usedStorageBytes = await getUserStorageUsageBytes(req.user.userId);
+  const remainingStorageBytes = Math.max(
+    MAX_UPLOAD_FILE_SIZE_BYTES - usedStorageBytes,
+    0,
+  );
+
+  return res.json({
+    success: true,
+    maxFileSizeBytes: MAX_UPLOAD_FILE_SIZE_BYTES,
+    usedStorageBytes,
+    remainingStorageBytes,
   });
 }
 
@@ -230,6 +606,25 @@ export async function updateUpload(req: AuthRequest, res: Response) {
     });
   }
 
+  if (parsed.data.size !== undefined) {
+    const uploadSize = parsed.data.size;
+
+    const quotaCheck = await validateUploadQuota({
+      userId: req.user.userId,
+      fileSizeBytes: uploadSize!,
+      excludedUploadId: upload._id.toString(),
+    });
+
+    if (!quotaCheck.ok) {
+      return res.status(quotaCheck.status).json({
+        message: quotaCheck.message,
+        maxFileSizeBytes: quotaCheck.maxFileSizeBytes,
+        usedStorageBytes: quotaCheck.usedStorageBytes,
+        remainingStorageBytes: quotaCheck.remainingStorageBytes,
+      });
+    }
+  }
+
   const previousFileKey = upload.s3Key || upload.file;
   const nextFileKey = parsed.data.s3Key || parsed.data.file;
 
@@ -258,7 +653,7 @@ export async function updateUpload(req: AuthRequest, res: Response) {
   }
 
   if (parsed.data.size !== undefined) {
-    upload.size = parsed.data.size;
+    upload.size = parsed.data.size!;
   }
 
   await upload.save();
@@ -309,6 +704,27 @@ export async function deleteUpload(req: AuthRequest, res: Response) {
   return res.json({
     message: "Upload deleted successfully",
     success: true,
+  });
+}
+
+export async function deleteAllUploads(req: AuthRequest, res: Response) {
+  if (!req.user) {
+    return res.status(401).json({
+      message: "Unauthorized",
+    });
+  }
+
+  const deletedFromS3 = await deleteObjectsFromS3ByPrefix(
+    `uploads/${req.user.userId}/`,
+  );
+
+  const result = await Upload.deleteMany({ user: req.user.userId });
+
+  return res.json({
+    message: "All uploads deleted successfully",
+    success: true,
+    deletedCount: result.deletedCount ?? deletedFromS3,
+    deletedFromS3,
   });
 }
 

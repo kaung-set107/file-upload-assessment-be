@@ -1,7 +1,8 @@
 import { randomUUID } from "crypto";
 import {
-  DeleteObjectCommand,
+  DeleteObjectsCommand,
   GetObjectCommand,
+  ListObjectsV2Command,
   PutObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
@@ -124,14 +125,62 @@ export async function createPresignedDownloadUrl(fileKey: string) {
 }
 
 export async function deleteObjectFromS3(fileKey: string) {
+  await deleteObjectsFromS3([fileKey]);
+}
+
+export async function deleteObjectsFromS3(fileKeys: string[]) {
+  const uniqueKeys = [...new Set(fileKeys.filter(Boolean))];
+
+  if (!uniqueKeys.length) {
+    return;
+  }
+
   const client = getS3Client();
   const bucket = getBucketName();
 
-  await client.send(
-    new DeleteObjectCommand({
-      Bucket: bucket,
-      Key: fileKey,
-    }),
-  );
+  for (let index = 0; index < uniqueKeys.length; index += 1000) {
+    const chunk = uniqueKeys.slice(index, index + 1000);
+
+    await client.send(
+      new DeleteObjectsCommand({
+        Bucket: bucket,
+        Delete: {
+          Objects: chunk.map((key) => ({ Key: key })),
+          Quiet: true,
+        },
+      }),
+    );
+  }
 }
 
+export async function deleteObjectsFromS3ByPrefix(prefix: string) {
+  const client = getS3Client();
+  const bucket = getBucketName();
+  let continuationToken: string | undefined;
+  let deletedCount = 0;
+
+  do {
+    const response = await client.send(
+      new ListObjectsV2Command({
+        Bucket: bucket,
+        Prefix: prefix,
+        ContinuationToken: continuationToken,
+      }),
+    );
+
+    const keys = (response.Contents ?? [])
+      .map((item) => item.Key)
+      .filter((key): key is string => Boolean(key));
+
+    if (keys.length > 0) {
+      await deleteObjectsFromS3(keys);
+      deletedCount += keys.length;
+    }
+
+    continuationToken = response.IsTruncated
+      ? response.NextContinuationToken
+      : undefined;
+  } while (continuationToken);
+
+  return deletedCount;
+}
